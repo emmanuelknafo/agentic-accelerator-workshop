@@ -1,0 +1,14 @@
+theme: jekyll-theme-minimal
+title: "Agentic Accelerator Workshop"
+description: "Learn to use AI-powered Accelerator agents — from Agents to Hero"
+baseurl: "/agentic-accelerator-workshop"
+plugins:
+  - jekyll-relative-links
+relative_links:
+  enabled: true
+  collections: true
+defaults:
+  - scope:
+      path: ""
+    values:
+      layout: "default"

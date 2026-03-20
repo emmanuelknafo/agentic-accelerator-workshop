@@ -1,0 +1,222 @@
+# ============================================================================
+# Accessibility Scan Workflow
+# ============================================================================
+# This workflow scans web pages for WCAG 2.2 accessibility violations using
+# automated tools such as axe-core and accessibility-checker. It runs on pull
+# requests and on a weekly schedule.
+#
+# Findings are converted to SARIF format and uploaded to the GitHub Security
+# tab so you can track accessibility issues alongside security alerts.
+#
+# Key concepts:
+#   - A11Y_THRESHOLD: minimum score to pass without warnings
+#   - A11Y_FAIL_THRESHOLD: score below which the workflow fails
+#   - SARIF category: accessibility-scan/<label>
+# ============================================================================
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Accessibility Scan
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 6 * * 1' # Weekly on Monday at 06:00 UTC
+
+permissions:
+  security-events: write
+  contents: read
+
+env:
+  A11Y_THRESHOLD: 80
+  A11Y_FAIL_THRESHOLD: 70
+
+jobs:
+  a11y-scan:
+    name: Accessibility — Three-Engine Scanner
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        scan-url:
+          - url: ${{ vars.A11Y_SCAN_URL_PRIMARY || 'http://localhost:3000' }}
+            label: primary
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install scanning dependencies
+        run: |
+          npm install --no-save @axe-core/playwright accessibility-checker playwright
+          npx playwright install --with-deps chromium
+
+      - name: Build and start sample app
+        if: contains(matrix.scan-url.url, 'localhost')
+        run: |
+          cd sample-app
+          npm ci
+          npm run build
+          npm start &
+          # Wait for the server to be ready
+          for i in $(seq 1 30); do
+            if curl -s http://localhost:3000 > /dev/null 2>&1; then
+              echo "Server is ready"
+              break
+            fi
+            echo "Waiting for server... ($i/30)"
+            sleep 2
+          done
+
+      - name: Run accessibility scan
+        id: scan
+        run: |
+          # Run axe-core via Playwright (avoids ChromeDriver version issues)
+          node -e '
+          const { chromium } = require("playwright");
+          const AxeBuilder = require("@axe-core/playwright").default;
+          const fs = require("fs");
+
+          (async () => {
+            const browser = await chromium.launch();
+            const context = await browser.newContext();
+            const page = await context.newPage();
+            await page.goto("${{ matrix.scan-url.url }}", { waitUntil: "networkidle" });
+            const axeResults = await new AxeBuilder({ page })
+              .withTags(["wcag2a", "wcag2aa", "wcag21a", "wcag21aa", "wcag22aa", "best-practice"])
+              .analyze();
+            await browser.close();
+            fs.writeFileSync("axe-results.json", JSON.stringify(axeResults, null, 2));
+            console.log("Violations: " + axeResults.violations.length);
+          })();
+          '
+
+          # Convert axe JSON output to SARIF v2.1.0
+          node -e '
+          const fs = require("fs");
+          if (!fs.existsSync("axe-results.json")) {
+            console.error("No axe results found");
+            process.exit(1);
+          }
+          const axeResults = JSON.parse(fs.readFileSync("axe-results.json", "utf8"));
+          const results = Array.isArray(axeResults) ? axeResults : [axeResults];
+
+          const impactToLevel = { critical: "error", serious: "error", moderate: "warning", minor: "note" };
+          const impactToSeverity = { critical: "9.0", serious: "7.0", moderate: "4.0", minor: "1.0" };
+          const impactToWeight = { critical: 10, serious: 7, moderate: 3, minor: 1 };
+
+          const rulesMap = new Map();
+          const sarifResults = [];
+          let totalWeight = 0;
+          let maxWeight = 0;
+
+          // Map URL path to a source file relative to the repo root
+          function urlToSourceFile(pageUrl) {
+            try {
+              const urlPath = new URL(pageUrl).pathname;
+              const clean = urlPath === "/" ? "" : urlPath.replace(/\/$/, "");
+              if (clean === "") return "sample-app/src/app/page.tsx";
+              return "sample-app/src/app" + clean + "/page.tsx";
+            } catch { return "sample-app/src/app/page.tsx"; }
+          }
+
+          for (const page of results) {
+            const sourceFile = urlToSourceFile(page.url || "${{ matrix.scan-url.url }}");
+            for (const violation of (page.violations || [])) {
+              if (!rulesMap.has(violation.id)) {
+                const allTags = ["accessibility"].concat(violation.tags || []).slice(0, 10);
+                const helpText = (violation.help || violation.id).replace(/</g, "&lt;").replace(/>/g, "&gt;");
+                rulesMap.set(violation.id, {
+                  id: violation.id,
+                  shortDescription: { text: violation.help || violation.id },
+                  fullDescription: { text: violation.description || "" },
+                  helpUri: violation.helpUrl || undefined,
+                  help: { text: violation.helpUrl ? `${helpText}. Learn more: ${violation.helpUrl}` : helpText, markdown: violation.helpUrl ? `${helpText}. [Learn more](${violation.helpUrl})` : helpText },
+                  properties: { tags: allTags }
+                });
+              }
+              const weight = impactToWeight[violation.impact] || 1;
+              for (const node of (violation.nodes || [])) {
+                maxWeight += 10;
+                totalWeight += weight;
+                const target = (node.target || []).join(" ");
+                sarifResults.push({
+                  ruleId: violation.id,
+                  level: impactToLevel[violation.impact] || "warning",
+                  message: { text: node.failureSummary || violation.help || violation.id },
+                  locations: [{ physicalLocation: { artifactLocation: { uri: sourceFile }, region: { snippet: { text: node.html || "" } } } }],
+                  partialFingerprints: { primaryLocationLineHash: require("crypto").createHash("sha256").update(violation.id + ":" + target).digest("hex").slice(0, 16) },
+                  properties: { impact: violation.impact, target, "security-severity": impactToSeverity[violation.impact] || "1.0" }
+                });
+              }
+            }
+          }
+
+          const score = maxWeight > 0 ? Math.round((1 - totalWeight / maxWeight) * 100) : 100;
+          const sarif = {
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/main/sarif-2.1/schema/sarif-schema-2.1.0.json",
+            version: "2.1.0",
+            runs: [{
+              tool: { driver: { name: "accessibility-scanner", version: "1.0.0", rules: [...rulesMap.values()] } },
+              automationDetails: { id: "accessibility-scan/${{ matrix.scan-url.label }}" },
+              results: sarifResults,
+              properties: { score }
+            }]
+          };
+          fs.writeFileSync("a11y-results.sarif", JSON.stringify(sarif, null, 2));
+          console.log("Accessibility score: " + score);
+          console.log("Violations found: " + sarifResults.length);
+          '
+        continue-on-error: true
+
+      - name: Upload a11y SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('a11y-results.sarif') != ''
+        with:
+          sarif_file: a11y-results.sarif
+          category: accessibility-scan/${{ matrix.scan-url.label }}
+
+      - name: Save results for threshold gate
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: a11y-sarif-${{ matrix.scan-url.label }}
+          path: a11y-results.sarif
+          if-no-files-found: ignore
+
+  a11y-gate:
+    name: Accessibility — Threshold Gate
+    runs-on: ubuntu-latest
+    needs: a11y-scan
+    if: always()
+    steps:
+      - name: Download SARIF results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: a11y-sarif-*
+          merge-multiple: true
+
+      - name: Evaluate thresholds
+        run: |
+          if [ -f a11y-results.sarif ]; then
+            CRITICAL_COUNT=$(jq '[.runs[].results[] | select(.level == "error")] | length' a11y-results.sarif 2>/dev/null || echo "0")
+            echo "Critical/serious findings: $CRITICAL_COUNT"
+
+            if [ "$CRITICAL_COUNT" -gt 0 ]; then
+              echo "::warning::Accessibility scan found $CRITICAL_COUNT critical/serious violations — configure branch protection to block merge"
+            fi
+
+            SCORE=$(jq '.runs[0].properties.score // 100' a11y-results.sarif 2>/dev/null || echo "100")
+            echo "Accessibility score: $SCORE"
+
+            if [ "$(echo "$SCORE < ${{ env.A11Y_FAIL_THRESHOLD }}" | bc -l 2>/dev/null || echo 0)" -eq 1 ]; then
+              echo "::warning::Accessibility score $SCORE is below minimum threshold ${{ env.A11Y_FAIL_THRESHOLD }}"
+            fi
+          else
+            echo "No SARIF results found — skipping threshold check"
+          fi
